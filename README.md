@@ -12,7 +12,7 @@ Adds drunk effects and alcohol blackouts to Sailwind. Drink too much too fast an
 - Water, coffee and tea clear alcohol that is still in your stomach. They do nothing for what has
   already reached your blood.
 - Sleeping sobers you up 3x faster than staying awake, so a night in bed clears a heavy session.
-  Being drunk still drains your rest while awake, the same as vanilla.
+- Rest never goes down while you are in bed, however drunk you are.
 - Blackout: you fall over where you stand. The fall uses physics, so you land on the deck and slide if
   the boat is heeling.
 - In single player, time runs at 16x while you are out, the same as sleeping. You wake once you have

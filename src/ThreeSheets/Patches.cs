@@ -74,10 +74,23 @@ namespace ThreeSheets
     /// from the shadow BAC right after vanilla has had its turn, so the stock visuals and vanilla's
     /// awake rest drain both follow this model instead of running on a separate number. The drain is
     /// deliberately left alone: drinking to get tired sooner is what alcohol is for in this game.
+    ///
+    /// The one exception is the bed. Vanilla keeps the alcohol drain running whenever you are not
+    /// actually asleep, including lying in the bed between its 4.5 hour sleep cycles, so a drunk
+    /// player watches the bar go down in bed. While GameState.inBed is set, vanilla is handed an
+    /// alcohol of zero for its update, so rest never goes down in bed; the real value is put back
+    /// straight after for the visuals and the save.
     /// </summary>
     [HarmonyPatch(typeof(PlayerNeeds), "LateUpdate")]
     public static class PlayerNeedsLateUpdatePatch
     {
+        [HarmonyPrefix]
+        public static void Prefix()
+        {
+            if (!Plugin.Enabled.Value) return;
+            if (GameState.inBed != null) PlayerNeeds.alcohol = 0f;
+        }
+
         [HarmonyPostfix]
         public static void Postfix()
         {
