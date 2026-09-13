@@ -13,7 +13,7 @@ namespace ThreeSheets
         public const string PluginName = "Three Sheets to the Wind (Drunk Mod)";
         // BepInEx 5 parses this as a strict System.Version. No SemVer suffixes, or the plugin
         // silently fails to load with no error.
-        public const string PluginVersion = "0.1.0";
+        public const string PluginVersion = "0.2.0";
 
         public static ManualLogSource Log;
 
@@ -32,6 +32,8 @@ namespace ThreeSheets
         // Drinking
         public static ConfigEntry<float> AbsorbRate;
         public static ConfigEntry<float> DecayRate;
+        public static ConfigEntry<float> WaterClearsStomach;
+        public static ConfigEntry<float> SoberingAsleep;
 
         // Blackout
         public static ConfigEntry<bool> BlackoutEnabled;
@@ -41,7 +43,6 @@ namespace ThreeSheets
         public static ConfigEntry<float> WakeAtBac;
         public static ConfigEntry<float> MinOutHours;
         public static ConfigEntry<float> MaxOutHours;
-        public static ConfigEntry<float> SoberingWhileOut;
         public static ConfigEntry<float> BlackoutSeconds;
         public static ConfigEntry<float> SleepQuality;
         public static ConfigEntry<float> HangoverWaterCost;
@@ -131,6 +132,12 @@ namespace ThreeSheets
             DecayRate = Slider(SecDrinking, "DecayRate", 12f, 0f, 60f,
                 "How fast you sober up, per second of game time. 12 is the vanilla rate. 0 holds your " +
                 "drunkenness steady, which is useful for tuning the effects.");
+            WaterClearsStomach = Slider(SecDrinking, "WaterClearsStomach", 12f, 0f, 60f,
+                "Alcohol removed from your stomach per gulp of water, coffee or tea. Only clears what " +
+                "has not reached your blood yet. A sip of wine is 12.");
+            SoberingAsleep = Slider(SecDrinking, "SoberingAsleep", 3f, 1f, 8f,
+                "How much faster alcohol wears off while you are asleep or passed out. 1 is the awake " +
+                "rate. At 3, one night in bed clears a heavy session.");
 
             // ---- 3. Blackout ----
             order = 1000;
@@ -152,14 +159,12 @@ namespace ThreeSheets
             MaxOutHours = Slider(SecBlackout, "MaxOutHours", 8f, 1f, 12f,
                 "Most game hours a blackout lasts. You wake still drunk if it reaches this. A warped " +
                 "blackout also ends after 75 real seconds.");
-            SoberingWhileOut = Slider(SecBlackout, "SoberingWhileOut", 3f, 1f, 8f,
-                "How much faster alcohol wears off while you are out. 1 is the normal rate.");
             BlackoutSeconds = Slider(SecBlackout, "OutSeconds", 20f, 3f, 120f,
                 "Real seconds spent unconscious when the time warp is off or another player is " +
                 "connected. Your ship keeps sailing.");
             SleepQuality = Slider(SecBlackout, "SleepQuality", 0.45f, 0f, 1f,
-                "Rest gained while out, as a share of normal sleep (8 rest per game hour). Rises " +
-                "toward normal as you sober up.");
+                "Rest gained while passed out, as a share of normal sleep (8 rest per game hour). Rises " +
+                "toward normal as you sober up. A bed rests you at the normal rate.");
             HangoverWaterCost = Slider(SecBlackout, "HangoverWaterCost", 15f, 0f, 80f,
                 "Extra hydration lost on waking, on top of the normal thirst for the hours you were out.");
             BlackoutGraceSeconds = Slider(SecBlackout, "GraceSeconds", 60f, 0f, 600f,

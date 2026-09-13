@@ -48,8 +48,9 @@ namespace ThreeSheets
             {
                 // Keep sobering up through a sleep or a menu, but leave the screen alone. Scaled dt, so
                 // a 16x sleep clears it at 16x the way vanilla does. A paused menu has dt 0, which is
-                // also correct - no time passes, so nothing wears off.
-                Drunkenness.Tick(Time.deltaTime);
+                // also correct - no time passes, so nothing wears off. Asleep in bed sobers faster,
+                // the same multiplier a blackout uses, so a night actually clears a binge.
+                Drunkenness.Tick(Time.deltaTime, GameState.sleeping ? Plugin.SoberingAsleep.Value : 1f);
                 effects.Restore();
                 if (moveScaleDirty) RestoreMoveScale();
                 return;

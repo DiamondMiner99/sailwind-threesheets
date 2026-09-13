@@ -175,7 +175,7 @@ namespace ThreeSheets
                 // Sobering runs faster while unconscious. At the normal rate a serious binge is half a
                 // day on a black screen; this keeps a heavy night to a few hours without flattening the
                 // difference between a heavy one and a light one.
-                Drunkenness.Tick(Time.deltaTime, Plugin.SoberingWhileOut.Value);
+                Drunkenness.Tick(Time.deltaTime, Plugin.SoberingAsleep.Value);
                 SleepItOff(dtHours);
 
                 // Out until it has worn off, which is what makes a big night cost more of the ship's day
@@ -464,11 +464,7 @@ namespace ThreeSheets
             PlayerNeeds.vitamins = Drain(PlayerNeeds.vitamins, 0.2f * hours, floor);
             PlayerNeeds.protein = Drain(PlayerNeeds.protein, 0.2f * hours, floor);
 
-            float threshold = Mathf.Max(1f, Plugin.BlackoutThreshold.Value);
-            float sobriety = 1f - Mathf.Clamp01(Drunkenness.Bac / threshold);
-            float quality = Mathf.Lerp(Mathf.Clamp01(Plugin.SleepQuality.Value), 1f, sobriety);
-
-            float rest = VanillaSleepPerHour * hours * quality;
+            float rest = VanillaSleepPerHour * hours * Drunkenness.SleepQualityNow;
             if (PlayerNeeds.sleepDebt < 100f)
             {
                 PlayerNeeds.sleepDebt = Mathf.Min(100f, PlayerNeeds.sleepDebt + rest);

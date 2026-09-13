@@ -100,6 +100,34 @@ namespace ThreeSheets
             Plugin.Log.LogInfo($"Swallowed {alcohol:F0}. stomach={Stomach:F0} bac={Bac:F0} committed={Committed:F0}");
         }
 
+        /// <summary>
+        /// A gulp of water. Clears alcohol that has not reached the blood yet, and nothing else: what
+        /// has already hit you is cleared by time and sleep only. So water is a way to stop it getting
+        /// worse in the warning window, not a way to chug yourself sober.
+        /// </summary>
+        public static void Dilute(float amount)
+        {
+            if (amount <= 0f || Stomach <= 0f) return;
+            float cleared = Mathf.Min(Stomach, amount);
+            Stomach -= cleared;
+            if (Stomach < 0.01f) Stomach = 0f;
+            Plugin.Log.LogInfo($"Diluted {cleared:F0}. stomach={Stomach:F0} bac={Bac:F0} committed={Committed:F0}");
+        }
+
+        /// <summary>
+        /// How well the player rests while passed out, as a share of normal sleep: SleepQuality at the
+        /// blackout threshold, 1 when sober, linear between. Blackout only; a bed rests you as vanilla.
+        /// </summary>
+        public static float SleepQualityNow
+        {
+            get
+            {
+                float threshold = Mathf.Max(1f, Plugin.BlackoutThreshold.Value);
+                float sobriety = 1f - Mathf.Clamp01(Bac / threshold);
+                return Mathf.Lerp(Mathf.Clamp01(Plugin.SleepQuality.Value), 1f, sobriety);
+            }
+        }
+
         /// <summary>Seed from a loaded save, or from anything that writes PlayerNeeds.alcohol behind our back.</summary>
         public static void SeedFromVanilla(float alcohol)
         {

@@ -9,6 +9,10 @@ Adds drunk effects and alcohol blackouts to Sailwind. Drink too much too fast an
 - Drunk effects: blurred instruments (the horizon stays in focus, things in your hands do not), color
   fringing, film grain, a slow wander on your view, extra lurch when walking, and the horizon rocking.
 - Tunnel vision closes in when you are close to passing out. Stop drinking and it opens back up.
+- Water, coffee and tea clear alcohol that is still in your stomach. They do nothing for what has
+  already reached your blood.
+- Sleeping sobers you up 3x faster than staying awake, so a night in bed clears a heavy session.
+  Being drunk still drains your rest while awake, the same as vanilla.
 - Blackout: you fall over where you stand. The fall uses physics, so you land on the deck and slide if
   the boat is heeling.
 - In single player, time runs at 16x while you are out, the same as sleeping. You wake once you have
@@ -47,7 +51,9 @@ Options are in `BepInEx/config/com.diamondminer99.threesheets.cfg` or the F1 men
 without a restart.
 
 - **General**: master switch. `FreeCursorInConfigMenu` stops the view turning while the F1 menu is open.
-- **Drinking**: how fast a drink reaches you (`AbsorbRate`) and how fast you sober up (`DecayRate`).
+- **Drinking**: how fast a drink reaches you (`AbsorbRate`), how fast you sober up (`DecayRate`), how
+  much a gulp of water clears from your stomach (`WaterClearsStomach`), and how much faster you sober
+  up asleep (`SoberingAsleep`).
 - **Blackout**: the blood alcohol that puts you down (`Threshold`, default 150; a sip of rum is 18, wine
   12, beer 6), where the tunnel vision warning starts, the time warp, how long you stay out, how well you
   rest, and the hangover.

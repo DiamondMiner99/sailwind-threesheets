@@ -23,14 +23,26 @@ namespace ThreeSheets
             if (!Plugin.Enabled.Value || __instance == null) return;
             // Mirrors the vanilla guard: an empty bottle is not a drink.
             if (__instance.health <= 0f) return;
-            __state = Liquids.GetLiquidAlcohol(__instance.amount);
+            float alcohol = Liquids.GetLiquidAlcohol(__instance.amount);
+            if (alcohol > 0f)
+            {
+                __state = alcohol;
+                return;
+            }
+            // Water, coffee and the teas: hydrating and alcohol-free, so a gulp dilutes what is still
+            // in the stomach. Sea water hydrates negatively and does nothing here either.
+            if (Liquids.GetLiquidHydration(__instance.amount) > 0)
+            {
+                __state = -Plugin.WaterClearsStomach.Value;
+            }
         }
 
         [HarmonyPostfix]
         public static void Postfix(float __state)
         {
-            if (!Plugin.Enabled.Value || __state <= 0f) return;
-            Drunkenness.Swallow(__state);
+            if (!Plugin.Enabled.Value || __state == 0f) return;
+            if (__state > 0f) Drunkenness.Swallow(__state);
+            else Drunkenness.Dilute(-__state);
         }
     }
 
@@ -59,8 +71,9 @@ namespace ThreeSheets
     /// <summary>
     /// Vanilla owns PlayerNeeds.alcohol: it decays it and clamps it to 0..100 every LateUpdate, and
     /// PlayerAlcohol reads it the same frame for bloom and exposure. Rather than fight that, drive it
-    /// from the shadow BAC right after vanilla has had its turn, so the stock visuals and the extra
-    /// sleep drain both follow this model instead of running on a separate number.
+    /// from the shadow BAC right after vanilla has had its turn, so the stock visuals and vanilla's
+    /// awake rest drain both follow this model instead of running on a separate number. The drain is
+    /// deliberately left alone: drinking to get tired sooner is what alcohol is for in this game.
     /// </summary>
     [HarmonyPatch(typeof(PlayerNeeds), "LateUpdate")]
     public static class PlayerNeedsLateUpdatePatch
