@@ -80,6 +80,11 @@ namespace ThreeSheets
     /// player watches the bar go down in bed. While GameState.inBed is set, vanilla is handed an
     /// alcohol of zero for its update, so rest never goes down in bed; the real value is put back
     /// straight after for the visuals and the save.
+    ///
+    /// The restore runs at the lowest priority so it lands after every other mod's postfix on this
+    /// method. NANDTweaks' Drunken Sleep option (on by default) is one such postfix: it drains rest
+    /// from PlayerNeeds.alcohol while asleep, and this mod loads before NANDTweaks, so without the
+    /// priority it would see the restored value and empty the bar in bed.
     /// </summary>
     [HarmonyPatch(typeof(PlayerNeeds), "LateUpdate")]
     public static class PlayerNeedsLateUpdatePatch
@@ -88,10 +93,11 @@ namespace ThreeSheets
         public static void Prefix()
         {
             if (!Plugin.Enabled.Value) return;
-            if (GameState.inBed != null) PlayerNeeds.alcohol = 0f;
+            if (GameState.inBed != null || GameState.sleeping) PlayerNeeds.alcohol = 0f;
         }
 
         [HarmonyPostfix]
+        [HarmonyPriority(Priority.Last)]
         public static void Postfix()
         {
             if (!Plugin.Enabled.Value) return;

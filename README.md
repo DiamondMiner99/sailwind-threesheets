@@ -44,6 +44,12 @@ client-side, so only the players who want it need to install it. When another pl
 time warp is skipped and the blackout lasts a fixed number of real seconds instead (20 by default).
 Other players do not see you fall yet.
 
+## Other mods
+
+NANDTweaks has a Drunken Sleep option that drains rest while you sleep drunk. With Three Sheets
+installed, rest does not go down in bed whether that option is on or off. Nothing else in NANDTweaks is
+affected.
+
 ## Config
 
 Options are in `BepInEx/config/com.diamondminer99.threesheets.cfg` or the F1 menu if you have the
