@@ -63,7 +63,7 @@ without a restart.
 - **Drinking**: how fast a drink reaches you (`AbsorbRate`), how fast you sober up (`DecayRate`), how
   much a gulp of water clears from your stomach (`WaterClearsStomach`), and how much faster you sober
   up asleep (`SoberingAsleep`).
-- **Blackout**: the blood alcohol that puts you down (`Threshold`, default 150; a sip of rum is 18, wine
+- **Blackout**: the blood alcohol that puts you down (`Threshold`, default 200, about twelve sips of rum back to back; a sip of rum is 18, wine
   12, beer 6), where the tunnel vision warning starts, the time warp, how long you stay out, how well you
   rest, and the hangover.
 - **Drunk Effects**: each effect has its own switch and strength.

@@ -173,7 +173,27 @@ namespace ThreeSheets
         public static void WakeRough()
         {
             Stomach = 0f;
+            EaseUnderTheWarning();
             GraceRemaining = Plugin.BlackoutGraceSeconds.Value;
+        }
+
+        /// <summary>
+        /// Brings blood alcohol down to just under the point where the tunnel vision starts, if it is
+        /// above it, for two reasons. Waking to fight a sinking ship and then dropping again the moment
+        /// the bilge is clear is a punishment for saving her. And a vignette pinned fully closed for the
+        /// next several game hours is a warning about a collapse that can no longer happen, since the
+        /// grace period and the parked level together mean the player is not going down.
+        ///
+        /// It is not a reward either: the level left behind is far above EffectsFull, so the player is
+        /// every bit as visibly drunk as they were, and one more sip walks it straight back up toward
+        /// the threshold.
+        /// </summary>
+        private static void EaseUnderTheWarning()
+        {
+            float threshold = Plugin.BlackoutThreshold.Value;
+            float warn = threshold * Mathf.Clamp01(Plugin.WarnFraction.Value);
+            float target = Mathf.Max(0f, warn - 1f);
+            if (Bac > target) Bac = target;
         }
 
         /// <summary>
@@ -185,8 +205,7 @@ namespace ThreeSheets
         public static void HoldUnderThreshold()
         {
             Stomach = 0f;
-            float threshold = Plugin.BlackoutThreshold.Value;
-            if (Bac >= threshold) Bac = Mathf.Max(0f, threshold - 1f);
+            EaseUnderTheWarning();
             GraceRemaining = Mathf.Max(GraceRemaining, Plugin.BlackoutGraceSeconds.Value);
         }
 

@@ -167,9 +167,9 @@ namespace ThreeSheets
             order = 1000;
             BlackoutEnabled = Toggle(SecBlackout, "Enabled", true,
                 "Pass out when your blood alcohol reaches Threshold.");
-            BlackoutThreshold = Slider(SecBlackout, "Threshold", 150f, 20f, 400f,
-                "Blood alcohol that puts you down. A sip of rum is 18, wine 12, beer 6. Drop it to 40 " +
-                "to test.");
+            BlackoutThreshold = Slider(SecBlackout, "Threshold", 200f, 20f, 400f,
+                "Blood alcohol that puts you down, which takes about twelve sips of rum drunk back to " +
+                "back. A sip of rum is 18, wine 12, beer 6. Drop it to 40 to test.");
             WarnFraction = Slider(SecBlackout, "WarnFraction", 0.7f, 0f, 1f,
                 "Where the tunnel vision starts closing in, as a share of Threshold. Measured against " +
                 "everything you have drunk, including what has not reached your blood yet.");
