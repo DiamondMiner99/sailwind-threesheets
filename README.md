@@ -18,6 +18,9 @@ Adds drunk effects and alcohol blackouts to Sailwind. Drink too much too fast an
 - In single player, time runs at 16x while you are out, the same as sleeping. You wake once you have
   sobered up enough, between 2 and 8 game hours later, still a bit drunk and thirsty. You get some rest
   while out, less than real sleep. Your boat keeps sailing the whole time.
+- If your ship starts taking water while you are out, you come round for it. You wake as drunk as
+  you went down, so you are bailing and pumping in the state that got you there. You also cannot
+  pass out on a ship that is already taking water.
 - You are not moved to port and nothing is taken from you.
 - Every effect can be turned off and every number changed.
 

@@ -15,24 +15,60 @@ namespace ThreeSheets
         private PlayerAlcohol playerAlcohol;
         private float rescanTimer;
         private bool moveScaleDirty;
+        private float frozenFor;
+        private float recoveringFor;
+        private bool unstuckLogged;
+
+        /// <summary>
+        /// How long a vanilla Recovery is allowed to hold control before the unstick net stops treating
+        /// it as a legitimate owner. Recovery.DoRecoverPlayer is about 6 real seconds of waits plus the
+        /// boat coroutine, so a minute is well past a healthy one and only a hung one reaches it.
+        /// </summary>
+        private const float RecoveryPatienceSeconds = 60f;
 
         private void Update()
         {
             if (!Plugin.Enabled.Value)
             {
-                // Turning the mod off mid-blackout must not leave the player frozen at 16x.
-                if (AnythingHeld()) BlackoutSequence.ForceRecover();
+                // Turning the mod off mid-blackout must not leave the player frozen at 16x. Only a
+                // LIVE blackout needs the forced recovery, though: once that has run, anything still
+                // held is leftover bookkeeping (a clock parked by the pause menu, say) and the ordinary
+                // restore retries it quietly, instead of writing a force-recover error every frame for
+                // as long as the mod stays switched off.
+                if (Drunkenness.BlackedOut) BlackoutSequence.ForceRecover();
+                else if (AnythingHeld()) BlackoutSequence.Restore();
                 if (moveScaleDirty) RestoreMoveScale();
                 effects.Restore();
                 return;
             }
 
+            UnstickPlayer();
+
             // The blackout watchdog. If the sequence throws, or a scene load kills the coroutine
             // mid-fade, the player would otherwise be left frozen behind a black screen with no way
             // out. Fail open, always.
-            if (Plugin.WatchdogDeadline > 0f && Time.unscaledTime > Plugin.WatchdogDeadline)
+            //
+            // It runs on unscaled time so a defeated warp cannot hide from it, and unscaled time keeps
+            // running while the pause menu holds Time.timeScale at zero. So the budget is not spent on a
+            // paused game: nothing is advancing, nothing is overdue, and a player who walked away from
+            // the menu should not come back to a blackout force-recovered behind a parked clock.
+            if (Plugin.WatchdogDeadline > 0f)
             {
-                BlackoutSequence.ForceRecover();
+                if (BlackoutGuard.GamePaused()) Plugin.WatchdogDeadline += Time.unscaledDeltaTime;
+                else if (Time.unscaledTime > Plugin.WatchdogDeadline) BlackoutSequence.ForceRecover();
+            }
+
+            // The guard runs from here, not only from inside the coroutine, so a dead coroutine is
+            // still caught. The coroutine gets first refusal - it unwinds in the right order, with the
+            // fade - and only if it has not acted within half a second does the watchdog force it.
+            if (Drunkenness.BlackedOut || AnythingHeld())
+            {
+                var reason = BlackoutGuard.Check();
+                BlackoutSequence.ReportAbort(reason);
+                if (BlackoutSequence.AbortOverdue)
+                {
+                    BlackoutSequence.ForceRecover(BlackoutSequence.ReportedReason);
+                }
             }
 
             if (Drunkenness.BlackedOut) return;
@@ -61,6 +97,10 @@ namespace ThreeSheets
             FindPostProcessing();
             effects.Apply(Drunkenness.Intensity, Drunkenness.Peril);
             ApplyMoveWobble(Drunkenness.Intensity);
+
+            // Not while the game is paused. The fall and both fades run on unscaled time, so a
+            // blackout started here would play out behind the pause menu against a stopped world.
+            if (BlackoutGuard.GamePaused()) return;
 
             if (ForcedBlackoutPressed())
             {
@@ -119,6 +159,78 @@ namespace ThreeSheets
         {
             if (Refs.ovrController != null) Refs.ovrController.SetMoveScaleMultiplier(1f);
             moveScaleDirty = false;
+        }
+
+        /// <summary>
+        /// Last resort for control THIS MOD took and did not manage to hand back.
+        ///
+        /// It deliberately does not infer that from a disabled CharacterController, because a bare
+        /// disabled controller is not evidence of anything. GoPointerButton.StickyClick
+        /// (GoPointerButton.cs:117-121) calls Refs.SetPlayerControl(false) and sets no GameState flag at
+        /// all - MouseLook.ToggleMouseLook is one static bool (MouseLook.cs:112-115); only
+        /// ToggleMouseLookAndCursor writes inCursorMenu (MouseLook.cs:117-120) - and that is the path the
+        /// helm, every rope winch and the bilge pump take, held for as long as the player is steering or
+        /// pumping. Sailwind Co-op's guest faint does the same for about four and a half seconds. Both
+        /// would read as "unexplained" to an elimination test, and switching movement back on under
+        /// either is a brand new way to walk someone off their own deck while drunk.
+        ///
+        /// So the net fires only while Plugin.ControlTaken says the hold is ours: this mod took control
+        /// and still believes it owes it back. Nothing else can be caught by it.
+        /// </summary>
+        private void UnstickPlayer()
+        {
+            if (!Plugin.UnstickPlayer.Value || !Plugin.ControlTaken)
+            {
+                frozenFor = 0f;
+                recoveringFor = 0f;
+                unstuckLogged = false;
+                return;
+            }
+
+            bool suspect;
+            try
+            {
+                // Recovery hands control back itself (Recovery.cs:107-108), so stay out of its way -
+                // but not forever. Recovery.DoRecoverPlayer waits on `while (!boatRecovered)`
+                // (Recovery.cs:103-106), and when GameState.lastOwnedBoat and FindClosestBoat() both
+                // come back null it never starts RecoverBoat at all (Recovery.cs:77-80), so that wait
+                // never ends, GameState.recovering never clears and its SetPlayerControl(true) is never
+                // reached. A healthy recovery is over in well under a minute, so after this dwell the
+                // player gets their movement back regardless of who is supposedly holding it.
+                bool recovering = GameState.recovering;
+                recoveringFor = recovering ? recoveringFor + Time.unscaledDeltaTime : 0f;
+
+                suspect = GameState.playing
+                    && !Drunkenness.BlackedOut
+                    && !GameState.sleeping
+                    && (!recovering || recoveringFor > RecoveryPatienceSeconds)
+                    && !GameState.currentlyLoading
+                    && GameState.inBed == null
+                    && (bool)Refs.charController
+                    && !Refs.charController.enabled;
+            }
+            catch { frozenFor = 0f; return; }
+
+            if (!suspect) { frozenFor = 0f; unstuckLogged = false; return; }
+
+            frozenFor += Time.unscaledDeltaTime;
+            if (frozenFor < Plugin.UnstickAfterSeconds.Value) return;
+
+            if (!unstuckLogged)
+            {
+                Plugin.Log.LogError(
+                    $"Movement has been off for {frozenFor:F1}s and this mod still owes it back. " +
+                    "Switching it back on.");
+                unstuckLogged = true;
+            }
+            try
+            {
+                if ((bool)Refs.ovrController) Refs.ovrController.enabled = true;
+                Refs.charController.enabled = true;
+                MouseLook.ToggleMouseLook(true);
+            }
+            catch (System.Exception e) { Plugin.Log.LogError("Unstick failed: " + e.Message); }
+            frozenFor = 0f;
         }
 
         /// <summary>

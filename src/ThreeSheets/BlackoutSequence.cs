@@ -35,14 +35,77 @@ namespace ThreeSheets
         /// </summary>
         private const float RealSecondsCap = 75f;
 
+        /// <summary>How long the plain fade to black takes when there is no fall to watch.</summary>
+        private const float BlindFadeSeconds = 2.5f;
+
         private static FieldInfo sleepDurationField;
         private static bool sleepDurationLookedUp;
 
         /// <summary>Game hours the last wait actually covered, used to size the hangover honestly.</summary>
         private static float hoursSlept;
 
+        /// <summary>Why the last blackout ended early, or None if it ran its course.</summary>
+        private static AbortReason abortReason;
+
+        /// <summary>Set by DrunkRunner when the guard fires, so a dead coroutine is still escalated.</summary>
+        private static AbortReason reported;
+        private static float reportedAt;
+
+        // One line per episode, not one per frame. Restore is called from DrunkRunner.Update every frame
+        // while anything is still held, so any log inside it is a log at frame rate unless it is latched.
+        private static bool standDownLogged;
+        private static bool clockDeferredLogged;
+        private static bool handbackFailedLogged;
+
+        /// <summary>
+        /// Forced recoveries since the last blackout that unwound on its own. Two in a row means the
+        /// failure is structural rather than bad luck, and the escalation in ForceRecover stops it
+        /// looping forever.
+        /// </summary>
+        private static int consecutiveForceRecovers;
+
+        /// <summary>
+        /// The exact string this mod last wrote into Sleep.instance.recoveryText, so ClearStatus can
+        /// tell its own message from Recovery's. Null when we have written nothing.
+        /// </summary>
+        private static string statusWeWrote;
+
+        /// <summary>
+        /// Told from outside that the world has changed under a running blackout. The coroutine gets
+        /// first refusal, because it unwinds in the right order and with a fade, so this only records
+        /// when the reason first appeared and lets the runner see whether anyone acted on it.
+        /// </summary>
+        public static void ReportAbort(AbortReason reason)
+        {
+            if (reason == AbortReason.None) { reported = AbortReason.None; return; }
+            if (reported == AbortReason.None) { reported = reason; reportedAt = Time.unscaledTime; }
+        }
+
+        /// <summary>True when the guard has been firing for half a second and the coroutine has not acted.</summary>
+        public static bool AbortOverdue =>
+            reported != AbortReason.None && Time.unscaledTime > reportedAt + 0.5f;
+
+        public static AbortReason ReportedReason => reported;
+
         public static IEnumerator Run(MonoBehaviour runner)
         {
+            abortReason = AbortReason.None;
+            reported = AbortReason.None;
+
+            // Vanilla will not let you into a bunk on a sinking ship (GPButtonBed.cs:21). Same idea one
+            // notch earlier: sober enough to bail, drunk enough to have caused it.
+            if (BlackoutGuard.RefuseToStart())
+            {
+                Plugin.Log.LogWarning("Not blacking out: the boat is taking water, or you are swimming or aloft.");
+                // Short, so the log does not repeat at frame rate. Deliberately NOT BlackoutGraceSeconds:
+                // the player drops the moment the bilge is clear, if they are still over the threshold.
+                Drunkenness.GraceRemaining = Mathf.Max(Drunkenness.GraceRemaining, 5f);
+                yield break;
+            }
+
+            int gen = ++Plugin.BlackoutGeneration;
+            BlackoutGuard.Arm();
+
             Drunkenness.BlackedOut = true;
 
             bool warp = Plugin.TimeWarpEnabled.Value && !Compat.OtherPlayerConnected && Sun.sun != null;
@@ -68,57 +131,131 @@ namespace ThreeSheets
             bool physical = ragdoll != null && Plugin.FallPhysical.Value && ragdoll.Begin();
             bool scripted = !physical && viewFall != null && viewFall.Begin(Plugin.CollapseSeconds.Value);
 
+            // The fade to black runs beside the fall rather than inside it, so it has its own clock and
+            // can outlive the loop that started it. Every path below therefore stops it before anything
+            // else writes the screen alpha: an abort can end the fall a tenth of a second in, and a fade
+            // left alive would finish on its own SetFadeLevel(1f) seconds AFTER the wake-up fade had
+            // cleared the screen. That leaves the player awake, in control, and looking at a black
+            // screen nothing will ever clear, which is the worst thing this mod can do to anyone.
+
             if (physical)
             {
                 // Fade weighted late and tied to the fall's own length, so vision closes as you land.
-                runner.StartCoroutine(Fade(1f, Plugin.FallWatchSeconds.Value * 0.9f, 2.6f));
+                Coroutine toBlack = runner.StartCoroutine(Fade(gen, 1f, Plugin.FallWatchSeconds.Value * 0.9f, 2.6f));
                 float guard = 0f;
                 while (!ragdoll.Settled && guard < Plugin.FallWatchSeconds.Value + 2f)
                 {
+                    if (gen != Plugin.BlackoutGeneration) { StopFade(runner, toBlack); yield break; }
+                    abortReason = BlackoutGuard.Check();
+                    if (abortReason != AbortReason.None) break;
                     guard += Time.unscaledDeltaTime;
                     yield return null;
                 }
+                StopFade(runner, toBlack);
+                // Full black even when this was cut short: the unwind stands the camera back up, and
+                // that snap is what the black screen is there to hide.
                 SetFadeLevel(1f);
                 // Stop the body wandering the deck for the rest of the blackout.
                 ragdoll.Freeze();
             }
             else if (scripted)
             {
-                runner.StartCoroutine(Fade(1f, Plugin.CollapseSeconds.Value * 0.95f, 2.4f));
-                while (viewFall.Running) yield return null;
+                Coroutine toBlack = runner.StartCoroutine(Fade(gen, 1f, Plugin.CollapseSeconds.Value * 0.95f, 2.4f));
+                while (viewFall.Running)
+                {
+                    if (gen != Plugin.BlackoutGeneration) { StopFade(runner, toBlack); yield break; }
+                    abortReason = BlackoutGuard.Check();
+                    if (abortReason != AbortReason.None) break;
+                    yield return null;
+                }
+                StopFade(runner, toBlack);
                 SetFadeLevel(1f);
             }
             else
             {
-                yield return runner.StartCoroutine(Fade(1f, 2.5f));
+                // Watched frame by frame like the two fall loops rather than awaited. This stretch is
+                // two and a half seconds long, and a leak crossing the wake line must not have to wait
+                // it out before the blackout can end.
+                Coroutine toBlack = runner.StartCoroutine(Fade(gen, 1f, BlindFadeSeconds));
+                float waited = 0f;
+                while (waited < BlindFadeSeconds)
+                {
+                    if (gen != Plugin.BlackoutGeneration) { StopFade(runner, toBlack); yield break; }
+                    abortReason = BlackoutGuard.Check();
+                    if (abortReason != AbortReason.None) break;
+                    waited += Time.unscaledDeltaTime;
+                    yield return null;
+                }
+                StopFade(runner, toBlack);
+                // Nothing moved the camera on this path, so an abort leaves the alpha where it got to
+                // and the wake-up fade takes it back from there instead of flashing the screen black.
+                if (abortReason == AbortReason.None) SetFadeLevel(1f);
             }
 
-            // --- Out cold. Now the clock runs ---
-            StartWarp(warp);
-            ShowPassedOut();
+            if (gen != Plugin.BlackoutGeneration) yield break;
 
-            if (warp)
-                yield return runner.StartCoroutine(WaitUntilSleptOff());
-            else
-                yield return runner.StartCoroutine(WaitRealSeconds(outSeconds));
+            // The pause menu parks the clock at zero (StartMenu.cs:410-411). Writing 16x into a parked
+            // clock takes the game back off pause and runs the world at 16x underneath the open menu, so
+            // the warp waits for the clock to run again. The guard keeps running while it waits, so a
+            // hull that floods while the menu is open still wakes the player.
+            while (abortReason == AbortReason.None && warp && BlackoutGuard.GamePaused())
+            {
+                if (gen != Plugin.BlackoutGeneration) yield break;
+                abortReason = BlackoutGuard.Check();
+                if (abortReason != AbortReason.None) break;
+                yield return null;
+            }
+
+            if (abortReason == AbortReason.None)
+            {
+                // --- Out cold. Now the clock runs ---
+                // A flooding hull never sees fixedDeltaTime 0.2222, not even for the one frame between
+                // starting the warp and the wait loop's first test.
+                StartWarp(warp && !BoatWatch.FloodingOrSunk());
+                ShowPassedOut();
+
+                if (warp) yield return runner.StartCoroutine(WaitUntilSleptOff(gen));
+                else yield return runner.StartCoroutine(WaitRealSeconds(outSeconds, gen));
+
+                if (gen != Plugin.BlackoutGeneration) yield break;
+            }
+
+            bool rough = abortReason != AbortReason.None;
+            if (rough) Plugin.Log.LogWarning($"Blackout ended early: {abortReason}.");
+
+            // Disarm BEFORE the unwind, not after it. The runner checks the guard every frame while a
+            // blackout is held, and the reason that ended this one is usually still true - the ship is
+            // still flooding - so leaving it armed through the wake-up fade would have the runner's
+            // escalation force a recovery on top of the orderly one already in progress.
+            BlackoutGuard.Disarm();
+            reported = AbortReason.None;
 
             ClearStatus();
 
             // Restore time BEFORE the wake-up fade, so coming round runs at normal speed and the player
             // is not handed back a ship moving at 16x while their eyes are still opening.
-            Restore();
+            Restore(rough);
 
-            ApplyHangover(hoursSlept);
+            if (rough) ApplyRoughWake(hoursSlept);
+            else ApplyHangover(hoursSlept);
 
             // Stand back up behind the black screen, so waking is a fade-in and not a snap.
             if (physical && ragdoll != null) ragdoll.Stop();
             else if (scripted && viewFall != null) viewFall.Stop();
 
-            yield return runner.StartCoroutine(Fade(0f, 3.5f));
+            yield return runner.StartCoroutine(Fade(gen, 0f, rough ? Plugin.RoughWakeSeconds.Value : 3.5f));
+
+            // Same rule as every other write in here: a sequence that has been replaced or
+            // force-recovered leaves the tidying to whoever replaced it. ForceRecover has already
+            // zeroed the deadline and cleared the flag, and it counts the failure it just handled.
+            if (gen != Plugin.BlackoutGeneration) yield break;
 
             LookDrift.ResetAccumulator();
             Plugin.WatchdogDeadline = 0f;
             Drunkenness.BlackedOut = false;
+            // A blackout that unwound on its own is proof the sequence still works, so the forced
+            // recoveries that came before it were bad luck rather than something structural.
+            consecutiveForceRecovers = 0;
             Plugin.Log.LogInfo($"Came round after {hoursSlept:F1} game hours.");
         }
 
@@ -127,10 +264,9 @@ namespace ThreeSheets
         /// when the sun is paused. Bails early if the player leaves the world, which would otherwise
         /// strand the warp in a dead scene.
         /// </summary>
-        private static IEnumerator WaitUntilSleptOff()
+        private static IEnumerator WaitUntilSleptOff(int gen)
         {
             float realElapsed = 0f;
-            int reasserts = 0;
             float minHours = Plugin.MinOutHours.Value;
             float maxHours = Mathf.Max(minHours, Plugin.MaxOutHours.Value);
             float wakeAt = Plugin.WakeAtBac.Value;
@@ -143,26 +279,14 @@ namespace ThreeSheets
                     yield break;
                 }
 
-                // Someone else put the clock back. Reassert a couple of times in case it was a one-off,
-                // then stop fighting: whatever is doing it is entitled to, and a tug of war over
-                // Time.timeScale is worse for the player than a shorter blackout.
-                if (Time.timeScale < SleepTimescale - 0.5f)
-                {
-                    if (reasserts < 3)
-                    {
-                        reasserts++;
-                        Plugin.Log.LogWarning(
-                            $"Time warp was reset by something else (timeScale={Time.timeScale:F2}), " +
-                            $"reasserting ({reasserts}/3).");
-                        Time.fixedDeltaTime = SleepTimeStep;
-                        Time.timeScale = SleepTimescale;
-                    }
-                    else
-                    {
-                        Plugin.Log.LogWarning("Time warp keeps being reset, ending the blackout early.");
-                        yield break;
-                    }
-                }
+                // The lease on the world this blackout was taken in. Checked before anything else in
+                // the loop body on purpose: a check placed after a write would re-force 16x for one
+                // frame on the way out. There is no reassert any more - if something takes the clock,
+                // that is ClockTaken and the blackout ends rather than fighting over Time.timeScale.
+                if (gen != Plugin.BlackoutGeneration) yield break;
+
+                abortReason = BlackoutGuard.Check();
+                if (abortReason != AbortReason.None) yield break;
 
                 // Vanilla Sleep.Update auto-wakes at 4.5 game hours and it is counting while our sleep
                 // flag is set. Hold its counter down so any configured duration is safe.
@@ -188,7 +312,11 @@ namespace ThreeSheets
                     yield break;
                 }
 
-                realElapsed += Time.unscaledDeltaTime;
+                // The real-time cap is there to stop a defeated warp holding the screen black for
+                // minutes. A paused game is not that: nothing is advancing, so nothing is overdue, and
+                // spending the budget on a player who walked away from the pause menu would end the
+                // blackout behind their back while the clock is still parked at zero.
+                if (!BlackoutGuard.GamePaused()) realElapsed += Time.unscaledDeltaTime;
                 if (realElapsed > RealSecondsCap)
                 {
                     Plugin.Log.LogWarning(
@@ -202,12 +330,18 @@ namespace ThreeSheets
         }
 
         /// <summary>The co-op path: no timescale change, so only the hours the world runs anyway pass.</summary>
-        private static IEnumerator WaitRealSeconds(float seconds)
+        private static IEnumerator WaitRealSeconds(float seconds, int gen)
         {
             float realElapsed = 0f;
             while (realElapsed < seconds)
             {
                 if (!GameState.playing) yield break;
+
+                if (gen != Plugin.BlackoutGeneration) yield break;
+
+                abortReason = BlackoutGuard.Check();
+                if (abortReason != AbortReason.None) yield break;
+
                 realElapsed += Time.unscaledDeltaTime;
                 float timescale = (Sun.sun != null) ? Sun.sun.timescale : 0f;
                 hoursSlept += Time.deltaTime * timescale;
@@ -261,6 +395,7 @@ namespace ThreeSheets
                         break;
                 }
                 tm.text = msg;
+                statusWeWrote = msg;
             }
             catch (System.Exception e)
             {
@@ -268,25 +403,39 @@ namespace ThreeSheets
             }
         }
 
+        /// <summary>
+        /// Blanks our own pass-out message and nothing else. Sleep.instance.recoveryText is not this
+        /// mod's field: Recovery writes its "recovering..." line into the same TextMesh about three real
+        /// seconds in (Recovery.cs:36-50) and clears it itself at the end (Recovery.cs:110). ForceRecover
+        /// can land in the middle of that, so the text is only blanked while it is still the exact string
+        /// ShowPassedOut put there.
+        /// </summary>
         private static void ClearStatus()
         {
+            if (statusWeWrote == null) return;
             try
             {
-                if (Sleep.instance != null && Sleep.instance.recoveryText != null)
+                if (Sleep.instance != null && Sleep.instance.recoveryText != null
+                    && Sleep.instance.recoveryText.text == statusWeWrote)
                     Sleep.instance.recoveryText.text = "";
             }
             catch { /* nothing to clear */ }
+            statusWeWrote = null;
         }
 
         // ---- suspend and restore ----
 
         private static void SuspendControl()
         {
+            // Set the flag BEFORE the write. Refs.SetPlayerControl is two unguarded assignments
+            // (Refs.cs:31-35), so a throw between them must leave the mod believing it took control,
+            // which is the safe direction. The old order, with the flag after the call, left the
+            // controller disabled and the mod believing it had taken nothing.
+            Plugin.ControlTaken = true;
             try
             {
                 MouseLook.ToggleMouseLook(false);
-                Refs.SetPlayerControl(false);
-                Plugin.ControlTaken = true;
+                SetControl(false);
             }
             catch (System.Exception e)
             {
@@ -313,6 +462,39 @@ namespace ThreeSheets
             }
         }
 
+        /// <summary>
+        /// Refs.SetPlayerControl (Refs.cs:31-35) has no null guards and writes two components in
+        /// sequence, so a throw on the first line leaves both off, and a throw on the second re-enables
+        /// OVRPlayerController while the CharacterController stays off - no movement, menus fine, which
+        /// is the reported symptom exactly. Write each one in its own try.
+        /// </summary>
+        /// <returns>
+        /// True only if BOTH components ended up in the requested state. A component that is missing or
+        /// destroyed counts as a failure when TAKING control and as a success when handing it back:
+        /// there is nothing left to hand back once the rig has gone with the scene or the main menu, and
+        /// reading that as a failed handback pinned ControlTaken true for the rest of the session, with
+        /// DrunkRunner retrying and logging every frame against references that were never coming back.
+        /// </returns>
+        private static bool SetControl(bool state)
+        {
+            bool ok = true;
+            try
+            {
+                if ((bool)Refs.ovrController) Refs.ovrController.enabled = state;
+                else if (!state) ok = false;
+            }
+            catch (System.Exception e) { ok = false; Plugin.Log.LogError("ovrController: " + e.Message); }
+
+            try
+            {
+                if ((bool)Refs.charController) Refs.charController.enabled = state;
+                else if (!state) ok = false;
+            }
+            catch (System.Exception e) { ok = false; Plugin.Log.LogError("charController: " + e.Message); }
+
+            return ok;
+        }
+
         private static void StartWarp(bool warp)
         {
             if (!warp) return;
@@ -324,18 +506,20 @@ namespace ThreeSheets
                 // vanilla sleep coroutine firing after its sleep was aborted - and it caught this mod
                 // instead, healing the warp within a frame or two. Its own comment names the legitimate
                 // case: "recovery's legit warp has GameState.sleeping==true". So claim the flag honestly.
-                //
-                // eyesFullyClosed is deliberately left alone. Sleep.WakeUp early-returns without it, so
-                // vanilla cannot wake the player out from under this sequence.
                 Plugin.SleepFlagWas = GameState.sleeping;
                 Plugin.SleepFlagHeld = true;
                 GameState.sleeping = true;
 
                 // eyesFullyClosed is what makes vanilla SleepUI show the sleep bar (it hides the bar
                 // while this is false), and what OceanUpdaterCrest reads to calm the sea to a quarter of
-                // its inertia during a sleep warp. Both are the vanilla sleep behavior wanted here. The
-                // cost is that Sleep.WakeUp stops refusing; nothing calls it during a solo blackout
-                // except Sleep.Update's 4.5-hour cap, and that counter is held at zero.
+                // its inertia during a sleep warp. Both are the vanilla sleep behavior wanted here.
+                //
+                // The cost is that Sleep.WakeUp stops refusing. Three vanilla paths can then reach into
+                // a live blackout: BoatDamage.Overflow at waterLevel > 0.1 (BoatDamage.cs:173, via
+                // WaveSplashZone), a hard impact (BoatImpactSounds.cs:57-61) and running aground
+                // (BoatImpactSounds.cs:110-116). All three are good reasons to come round, so the guard
+                // treats a cleared sleeping flag as a wake request (AbortReason.VanillaWoke) and stands
+                // the sequence down rather than fighting it.
                 Plugin.EyesFlagWas = GameState.eyesFullyClosed;
                 Plugin.EyesFlagHeld = true;
                 GameState.eyesFullyClosed = true;
@@ -345,6 +529,10 @@ namespace ThreeSheets
                 Plugin.TimeWarpHeld = true;
                 Time.fixedDeltaTime = SleepTimeStep;
                 Time.timeScale = SleepTimescale;
+                // Stamp what we wrote, so Restore can tell whether the clock it is looking at is still
+                // ours to put back.
+                Plugin.FixedStepWeWrote = SleepTimeStep;
+                Plugin.TimeScaleWeWrote = SleepTimescale;
             }
             catch (System.Exception e)
             {
@@ -357,26 +545,99 @@ namespace ThreeSheets
         /// Undoes everything SuspendControl and StartWarp did. Safe to call twice, and safe to call from
         /// the watchdog on a sequence that died halfway through.
         /// </summary>
-        public static void Restore()
+        /// <param name="rough">
+        /// True when something woke the player rather than them sleeping it off, which shortens the
+        /// audio transition so the sea and the rigging come back with them.
+        /// </param>
+        public static void Restore(bool rough = false)
         {
-            if (Plugin.TimeWarpHeld)
+            // If a vanilla Recovery is running, it owns the sleep flags and the clock now. Recovery.cs:31
+            // calls Sleep.FallAsleep and Recovery.cs:91-94 is the ONLY thing that puts Time.timeScale
+            // back to 1 and clears eyesFullyClosed - clearing GameState.sleeping first makes it skip that
+            // and leaves the game at 16x on a 0.2222 second step permanently. Release our bookkeeping and
+            // write nothing. Recovery.cs:107-109 ends with its own unconditional MouseLook and
+            // SetPlayerControl(true).
+            bool recovering = false;
+            try { recovering = GameState.recovering; } catch { }
+            if (recovering)
             {
-                try
+                // Logged once per recovery, not once per frame. DrunkRunner calls this every frame
+                // while anything is still held, ControlTaken is deliberately left true below, and
+                // BepInEx writes its log file synchronously - so the frame cost of one line per frame
+                // lands on top of a recovery that is already teleporting the player and their boat.
+                if (!standDownLogged)
                 {
-                    // Restore to what was actually there, but never to a stopped or warped clock -
-                    // reading a bad value back would leave the game frozen or stuck at 16x.
-                    Time.timeScale = (Plugin.TimeScaleWas > 0.01f && Plugin.TimeScaleWas < 2f)
-                        ? Plugin.TimeScaleWas : 1f;
-                    Time.fixedDeltaTime = (Plugin.FixedStepWas > 0.001f && Plugin.FixedStepWas < 0.1f)
-                        ? Plugin.FixedStepWas : InitialTimeStep;
-                }
-                catch (System.Exception e)
-                {
-                    Plugin.Log.LogError("Could not end the time warp cleanly: " + e.Message);
-                    Time.timeScale = 1f;
-                    Time.fixedDeltaTime = InitialTimeStep;
+                    Plugin.Log.LogWarning(
+                        "A recovery is running; standing down without touching the clock or the sleep flags.");
+                    standDownLogged = true;
                 }
                 Plugin.TimeWarpHeld = false;
+                Plugin.EyesFlagHeld = false;
+                Plugin.SleepFlagHeld = false;
+                // godMode is ours alone - Recovery never reads or writes it - and leaving it set would
+                // stop needs ticking forever, so it is still restored.
+                RestoreGodMode();
+                // Control is left to Recovery. ControlTaken stays TRUE so the unstick net still covers us
+                // if Recovery never reaches its own restore, which it does not when it cannot find a
+                // boat (Recovery.cs:77-80 skips RecoverBoat, so the wait at Recovery.cs:103-106 never
+                // ends). DrunkRunner gives that a long dwell and then frees the player anyway.
+                return;
+            }
+            standDownLogged = false;
+
+            if (Plugin.TimeWarpHeld)
+            {
+                // A parked clock is still ours. StartMenu.GameToSettings saves the live timeScale and
+                // writes zero (StartMenu.cs:410-411), and SettingsToGame writes the saved value straight
+                // back on close (StartMenu.cs:424) - and the value it saved is our 16x. Reading that zero
+                // as somebody else's clock, writing nothing and clearing the hold is exactly how the
+                // game ended up running at 16x for good with nothing left to undo it. So while the clock
+                // is parked, keep the hold and write neither value: DrunkRunner calls this every frame
+                // while anything is held, so the retry lands the moment the menu hands 16x back.
+                // The clock alone decides this, not the menu flag. GameToSettings always zeroes the
+                // clock, so the pause case is covered by the timeScale test on its own, and a cursor
+                // menu that does NOT stop time (the map table, a shop) must not hold the warp open:
+                // that would leave the world running at 16x for as long as the menu is up.
+                bool parked = false;
+                try { parked = Time.timeScale <= 0.01f; } catch { }
+
+                if (parked)
+                {
+                    if (!clockDeferredLogged)
+                    {
+                        Plugin.Log.LogInfo(
+                            "The clock is parked while the game is paused; holding the time warp until it runs again.");
+                        clockDeferredLogged = true;
+                    }
+                }
+                else
+                {
+                    clockDeferredLogged = false;
+                    try
+                    {
+                        // Only put a value back if it is still the value we wrote. Someone else's clock
+                        // is someone else's business, and stomping it is how the 16x leak happened.
+                        if (Mathf.Abs(Time.timeScale - Plugin.TimeScaleWeWrote) < 0.5f)
+                        {
+                            Time.timeScale = (Plugin.TimeScaleWas > 0.01f && Plugin.TimeScaleWas < 2f)
+                                ? Plugin.TimeScaleWas : 1f;
+                        }
+                        // timeScale first, then the step: a small fixed step under a 16x scale makes the
+                        // engine try to catch up sixteen times the fixed steps in one frame.
+                        if (Mathf.Abs(Time.fixedDeltaTime - Plugin.FixedStepWeWrote) < 0.01f)
+                        {
+                            Time.fixedDeltaTime = (Plugin.FixedStepWas > 0.001f && Plugin.FixedStepWas < 0.1f)
+                                ? Plugin.FixedStepWas : InitialTimeStep;
+                        }
+                    }
+                    catch (System.Exception e)
+                    {
+                        Plugin.Log.LogError("Could not end the time warp cleanly: " + e.Message);
+                        Time.timeScale = 1f;
+                        Time.fixedDeltaTime = InitialTimeStep;
+                    }
+                    Plugin.TimeWarpHeld = false;
+                }
             }
 
             if (Plugin.EyesFlagHeld)
@@ -406,7 +667,7 @@ namespace ThreeSheets
                 try
                 {
                     if (AudioMixers.instance != null)
-                        AudioMixers.instance.gameActiveSnapshot.TransitionTo(4f);
+                        AudioMixers.instance.gameActiveSnapshot.TransitionTo(rough ? 0.35f : 4f);
                 }
                 catch (System.Exception e)
                 {
@@ -414,32 +675,50 @@ namespace ThreeSheets
                 }
             }
 
-            if (Plugin.GodModeHeld)
-            {
-                try
-                {
-                    if (PlayerNeeds.instance != null) PlayerNeeds.instance.godMode = Plugin.GodModeWas;
-                }
-                catch (System.Exception e)
-                {
-                    Plugin.Log.LogError("Could not restore needs after blackout: " + e.Message);
-                }
-                Plugin.GodModeHeld = false;
-            }
+            RestoreGodMode();
 
             if (Plugin.ControlTaken)
             {
-                try
+                bool ok = SetControl(true);
+                try { MouseLook.ToggleMouseLook(true); }
+                catch (System.Exception e) { Plugin.Log.LogError("Could not re-enable mouse look: " + e.Message); }
+
+                // Only forget that we took control if we actually gave it back. The old code cleared this
+                // unconditionally after swallowing the exception, so a half-failed handback left the
+                // player frozen with AnythingHeld() false and nothing, watchdog included, ever retrying.
+                // DrunkRunner.Update retries every frame while this stays true. The retry itself is two
+                // bool writes and a static bool (MouseLook.cs:112-115), so it is the LOG that has to be
+                // held down to one line per episode rather than one per frame.
+                Plugin.ControlTaken = !ok;
+                if (!ok)
                 {
-                    Refs.SetPlayerControl(true);
-                    MouseLook.ToggleMouseLook(true);
+                    if (!handbackFailedLogged)
+                    {
+                        Plugin.Log.LogError("Player control was not fully handed back; will retry every frame.");
+                        handbackFailedLogged = true;
+                    }
                 }
-                catch (System.Exception e)
-                {
-                    Plugin.Log.LogError("Could not hand player control back: " + e.Message);
-                }
-                Plugin.ControlTaken = false;
+                else handbackFailedLogged = false;
             }
+        }
+
+        /// <summary>
+        /// Needs are ours alone for the length of a blackout, so this is the one piece of bookkeeping
+        /// that is put back even on the paths where we hand the rest of the world to somebody else.
+        /// Leaving godMode set stops hunger, thirst and rest ticking for the rest of the save.
+        /// </summary>
+        private static void RestoreGodMode()
+        {
+            if (!Plugin.GodModeHeld) return;
+            try
+            {
+                if (PlayerNeeds.instance != null) PlayerNeeds.instance.godMode = Plugin.GodModeWas;
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogError("Could not restore needs after blackout: " + e.Message);
+            }
+            Plugin.GodModeHeld = false;
         }
 
         /// <summary>
@@ -499,6 +778,23 @@ namespace ThreeSheets
         }
 
         /// <summary>
+        /// Coming round because something woke you, not because you slept it off. Twenty real seconds of
+        /// blackout burned almost no alcohol, so you come back exactly as drunk as you went down, which
+        /// is the point when the ship is going under and you have to fight for her. The stomach is still
+        /// emptied, so drink that was in flight cannot put you straight back down.
+        ///
+        /// No HangoverWaterCost: that is the alcohol's own dehydration from a night's sleep, and you did
+        /// not get one. The hours that did pass were already charged frame by frame in SleepItOff.
+        /// </summary>
+        private static void ApplyRoughWake(float hours)
+        {
+            Drunkenness.WakeRough();
+            PlayerNeeds.alcohol = Mathf.Clamp(Drunkenness.Bac, 0f, 100f);
+            Plugin.Log.LogInfo(
+                $"Shaken awake after {hours:F1}h, bac {Drunkenness.Bac:F0}, rest {PlayerNeeds.sleep:F0}.");
+        }
+
+        /// <summary>
         /// Sleep.Update counts currentSleepDuration whenever GameState.sleeping is set and calls WakeUp
         /// past 4.5 game hours. This sequence owns when the player wakes, so keep that counter at zero.
         /// </summary>
@@ -528,8 +824,15 @@ namespace ThreeSheets
         /// <summary>
         /// Vanilla Blackout.FadeTo does the same job but steps on Time.deltaTime, which runs at 16x
         /// during the warp and would make both fades flash past. Unscaled only.
+        ///
+        /// The generation stamp is not decoration. Both fades write the same OVRScreenFade on
+        /// Camera.main that vanilla's Blackout.FadeTo writes (Blackout.cs:8), so whichever finishes last
+        /// wins the screen. Once the generation has moved on this loop writes nothing more AND skips its
+        /// closing SetFadeLevel, which is what keeps an orphaned fade to black from re-blacking a screen
+        /// the wake-up fade has already cleared. ForceRecover bumps the generation before it clears the
+        /// alpha, so that path is covered by this stamp alone.
         /// </summary>
-        private static IEnumerator Fade(float target, float duration, float ease = 1f)
+        private static IEnumerator Fade(int gen, float target, float duration, float ease = 1f)
         {
             var fade = GetFade();
             if (fade == null)
@@ -542,13 +845,28 @@ namespace ThreeSheets
             float elapsed = 0f;
             while (elapsed < duration)
             {
+                if (gen != Plugin.BlackoutGeneration) yield break;
                 elapsed += Time.unscaledDeltaTime;
                 // ease > 1 holds the screen clear then drops it late, so a fall stays watchable.
                 float k = Mathf.Pow(Mathf.Clamp01(elapsed / duration), ease);
                 fade.SetFadeLevel(Mathf.Lerp(start, target, k));
                 yield return null;
             }
+            if (gen != Plugin.BlackoutGeneration) yield break;
             fade.SetFadeLevel(target);
+        }
+
+        /// <summary>
+        /// Stops a fade this sequence started. The generation stamp inside Fade covers a blackout that
+        /// was replaced or force-recovered, but an ORDERLY abort does not bump the generation - it
+        /// breaks out of the fall loop and unwinds - so the handle is what covers that, which is the
+        /// common case now that the guard can end a blackout mid-fall.
+        /// </summary>
+        private static void StopFade(MonoBehaviour runner, Coroutine fade)
+        {
+            if (runner == null || fade == null) return;
+            try { runner.StopCoroutine(fade); }
+            catch (System.Exception e) { Plugin.Log.LogWarning("Could not stop the fade: " + e.Message); }
         }
 
         private static void SetFadeLevel(float level)
@@ -570,11 +888,21 @@ namespace ThreeSheets
             }
         }
 
-        /// <summary>Last resort, called by the runner's watchdog if the sequence never finished.</summary>
-        public static void ForceRecover()
+        /// <summary>
+        /// Last resort, called by the runner's watchdog or when the guard has been firing and the
+        /// coroutine has not acted on it.
+        /// </summary>
+        public static void ForceRecover(AbortReason reason = AbortReason.None)
         {
-            Plugin.Log.LogError("Blackout watchdog fired - forcing everything back.");
-            Restore();
+            Plugin.Log.LogError($"Blackout force-recover ({reason}) - putting everything back.");
+
+            // Orphan any coroutine still alive. Every write it makes is generation-guarded, so it exits
+            // at its next yield writing nothing. This is the direct kill for the worst leak in v0.2.0:
+            // ForceRecover cleared TimeWarpHeld and zeroed WatchdogDeadline while the coroutine was still
+            // running, and the reassert branch then re-forced 16x with nobody left to undo it.
+            Plugin.BlackoutGeneration++;
+
+            Restore(rough: true);
             ClearStatus();
             try
             {
@@ -596,8 +924,29 @@ namespace ThreeSheets
             {
                 Plugin.Log.LogError("Could not clear the screen fade: " + e.Message);
             }
-            Drunkenness.SoberUp();
+            // Deliberately NOT Drunkenness.SoberUp(). Wiping the blood alcohol on every failure path is
+            // a free sober-up the player did not earn, and it makes real bug reports read as "sometimes
+            // I wake up completely sober". Keep the drink, empty the stomach, arm the grace period.
+            Drunkenness.WakeRough();
+
+            // Twice in a row is not bad luck. If the cause is structural - a renamed vanilla field that
+            // throws on JIT inside the coroutine, say - WakeRough leaves the player over the threshold,
+            // so the grace period expires and they go straight back down: a black screen every couple of
+            // minutes for the rest of the session. Parking the level just under the threshold as well
+            // makes a broken blackout stop happening instead of looping, which is the right way for this
+            // to fail. The drink itself is kept, so vanilla's awake rest drain is untouched.
+            consecutiveForceRecovers++;
+            if (consecutiveForceRecovers >= 2)
+            {
+                Drunkenness.HoldUnderThreshold();
+                Plugin.Log.LogError(
+                    $"That is {consecutiveForceRecovers} forced recoveries in a row, so something is " +
+                    "wrong with the blackout itself. Holding you under the threshold so it cannot loop.");
+            }
             Drunkenness.BlackedOut = false;
+            BlackoutGuard.Disarm();
+            abortReason = AbortReason.None;
+            reported = AbortReason.None;
             Plugin.WatchdogDeadline = 0f;
         }
     }

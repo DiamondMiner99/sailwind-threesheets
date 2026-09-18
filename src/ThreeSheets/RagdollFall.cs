@@ -33,13 +33,21 @@ namespace ThreeSheets
         private GameObject proxy;
         private Rigidbody body;
 
-        private Vector3 startLocalPos;
         private Quaternion startLocalRot;
         private Quaternion camRestLocalRot;
 
+        // The camera's OWN local pose, which is what Stop() puts back. Kept separate from the spawn
+        // point below: conflating the two is what dropped the eye another 0.3m on every physical
+        // blackout, and what welded the view to a wreck when the frame moved.
+        private Vector3 camRestLocalPos;
+        private Quaternion camRestLocalRotL;
+        private bool poseSaved;
+
+        /// <summary>Frame-local spawn point for the proxy, including the drop to chest height.</summary>
+        private Vector3 proxySpawnLocalPos;
+
         private float elapsed;
         private bool running;
-        private bool held;
         private bool frozen;
 
         public bool Running => running;
@@ -73,30 +81,44 @@ namespace ThreeSheets
                 return false;
             }
 
+            // The camera's own local pose, the way CollapseAnimator saves it. Nothing in Sailwind writes
+            // CenterEyeAnchor's local transform except BoatCamera.SwitchOff (BoatCamera.cs:95), so this
+            // is the only restore that survives the player and the boat separating.
+            camRestLocalPos = cam.localPosition;
+            camRestLocalRotL = cam.localRotation;
+
             // Start the proxy exactly where the camera already is, expressed in frame-local coordinates.
             // Those numbers are valid in BOTH frames, which is the whole reason this works.
-            startLocalPos = InverseTransformPoint(visualParent, cam.position);
+            proxySpawnLocalPos = InverseTransformPoint(visualParent, cam.position);
             camRestLocalRot = Quaternion.Inverse(visualParent.rotation) * cam.rotation;
 
             // Spawn slightly below the eye, at about chest height. The capsule is 1.15 tall, and
             // starting it centred on the camera puts its lower cap uncomfortably close to the deck.
-            startLocalPos += Vector3.down * 0.3f;
+            // This offset goes ONLY into the spawn point, never into what Stop() restores from.
+            proxySpawnLocalPos += Vector3.down * 0.3f;
 
             // Refuse to spawn inside anything. A capsule created overlapping a collider gets ejected by
             // depenetration, which is violent and is exactly how a body ends up through a hull - crate
             // depenetration has already sunk a moored brig in this game once. Below decks, in a bunk, or
             // jammed against a bulkhead, the scripted collapse is the correct answer instead.
-            Vector3 worldSpawn = TransformPoint(physicsParent, startLocalPos);
+            Vector3 worldSpawn = TransformPoint(physicsParent, proxySpawnLocalPos);
             if (IsObstructed(worldSpawn))
             {
                 Plugin.Log.LogInfo("No room to fall here, using the scripted collapse instead.");
                 return false;
             }
 
+            // Armed only once every refusal above has been passed. Set any earlier and an attempt that
+            // bailed out - no room to fall, so the scripted collapse runs instead and Stop() is never
+            // called - leaves a stale snapshot behind, which the NEXT Begin()'s leading Stop() would
+            // then write onto a camera whose local pose has legitimately moved since (a crouch, or a
+            // BoatCamera.SwitchOn/SwitchOff reparent at BoatCamera.cs:95).
+            poseSaved = true;
+
             proxy = new GameObject("ThreeSheetsFallProxy");
             proxy.layer = DroppedItemLayer;
             proxy.transform.SetParent(physicsParent, worldPositionStays: false);
-            proxy.transform.localPosition = startLocalPos;
+            proxy.transform.localPosition = proxySpawnLocalPos;
             proxy.transform.localRotation = Quaternion.identity;
             startLocalRot = proxy.transform.localRotation;
 
@@ -143,7 +165,6 @@ namespace ThreeSheets
             frozen = false;
             Settled = false;
             running = true;
-            held = true;
             return true;
         }
 
@@ -159,6 +180,12 @@ namespace ThreeSheets
                 body.angularVelocity = Vector3.zero;
                 body.isKinematic = true;
                 frozen = true;
+
+                // Stop pinning the camera the moment the body lands. In v0.2.0 Freeze left this running,
+                // so LateUpdate kept writing cam.position from frames cached at Begin() for the whole
+                // blackout - up to 75 real seconds, through a disembark, through a sinking. The camera
+                // now sits where it landed, parented as it always was, and moves with its parent.
+                running = false;
             }
         }
 
@@ -166,13 +193,21 @@ namespace ThreeSheets
         public void Stop()
         {
             running = false;
-            if (held && cam != null && visualParent != null)
+
+            // Restore the camera's OWN local pose. v0.2.0 wrote a world position computed through
+            // visualParent, a frame that may be hundreds of meters down a wreck by now, which welded the
+            // view there permanently. This also drops the baked-in boat roll: camRestLocalRot captured
+            // the boat's attitude at Begin, so a ship that heeled or capsized left the horizon tilted.
+            if (poseSaved)
             {
-                // Back to standing, at wherever the frame has moved to by now.
-                cam.position = TransformPoint(visualParent, startLocalPos);
-                cam.rotation = visualParent.rotation * camRestLocalRot;
+                if (cam == null && Camera.main != null) cam = Camera.main.transform;
+                if (cam != null)
+                {
+                    cam.localPosition = camRestLocalPos;
+                    cam.localRotation = camRestLocalRotL;
+                }
             }
-            held = false;
+            poseSaved = false;
 
             if (proxy != null) Destroy(proxy);
             proxy = null;
@@ -186,9 +221,24 @@ namespace ThreeSheets
 
             if (cam == null || proxy == null || visualParent == null)
             {
-                // A scene change pulled the world out from under the fall.
+                // A scene change, a stream-out or a co-op boat removal pulled the world out from under
+                // the fall. Stop pinning, but KEEP poseSaved: a local-transform restore is still valid
+                // when the parent is dead, and v0.2.0 gave that up here, so Stop() restored nothing at
+                // all and the camera was abandoned at the last world pose it was given.
+                Plugin.Log.LogWarning("The fall lost its frame; the camera will be put back from its own local pose.");
                 running = false;
-                held = false;
+                return;
+            }
+
+            // The frames were cached in Begin(). If the player has been reparented since - vanilla's
+            // swim-disembark (PlayerEmbarkerNew.cs:70-89) is exactly this - the pin is now writing the
+            // camera through a frame the body is no longer in. Stop rather than follow the wreck down.
+            var cc = Refs.charController;
+            if ((bool)cc && cc.transform.parent != physicsParent)
+            {
+                Plugin.Log.LogWarning("The player was moved out of the frame the fall started in; releasing the camera.");
+                Freeze();
+                Settled = true;
                 return;
             }
 
@@ -209,8 +259,9 @@ namespace ThreeSheets
             // The leash. Whatever physics does, the camera does not follow a body that has left the
             // world - through the deck, ejected by a collision, or over the side. Freeze where it went
             // wrong and let the sequence carry on: a blackout that ends slightly oddly beats a camera
-            // sinking through a hull into open water.
-            float strayed = (localPos - startLocalPos).magnitude;
+            // sinking through a hull into open water. Note it measures displacement INSIDE the frame, so
+            // a whole frame descending reads as zero stray; the reparent test above is what catches that.
+            float strayed = (localPos - proxySpawnLocalPos).magnitude;
             if (strayed > Plugin.RagdollLeash.Value)
             {
                 Plugin.Log.LogWarning(

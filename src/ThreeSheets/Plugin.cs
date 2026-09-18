@@ -13,7 +13,7 @@ namespace ThreeSheets
         public const string PluginName = "Three Sheets to the Wind (Drunk Mod)";
         // BepInEx 5 parses this as a strict System.Version. No SemVer suffixes, or the plugin
         // silently fails to load with no error.
-        public const string PluginVersion = "0.2.0";
+        public const string PluginVersion = "0.2.1";
 
         public static ManualLogSource Log;
 
@@ -28,6 +28,8 @@ namespace ThreeSheets
 
         public static ConfigEntry<bool> Enabled;
         public static ConfigEntry<bool> FreeCursorInConfigMenu;
+        public static ConfigEntry<bool> UnstickPlayer;
+        public static ConfigEntry<float> UnstickAfterSeconds;
 
         // Drinking
         public static ConfigEntry<float> AbsorbRate;
@@ -48,6 +50,9 @@ namespace ThreeSheets
         public static ConfigEntry<float> HangoverWaterCost;
         public static ConfigEntry<float> BlackoutGraceSeconds;
         public static ConfigEntry<float> HangoverFloor;
+        public static ConfigEntry<bool> WakeWhenFlooding;
+        public static ConfigEntry<float> FloodWakeLevel;
+        public static ConfigEntry<float> RoughWakeSeconds;
 
         // Drunk effects
         public static ConfigEntry<float> EffectsStart;
@@ -107,6 +112,18 @@ namespace ThreeSheets
         public static bool EyesFlagHeld;
         public static bool EyesFlagWas;
 
+        /// <summary>
+        /// Bumped on every blackout start and every unwind. A coroutine whose generation no longer
+        /// matches writes nothing and exits at its next yield, so a forced recovery cannot be undone a
+        /// frame later by the sequence it replaced.
+        /// </summary>
+        public static int BlackoutGeneration;
+
+        // What Restore is allowed to put back. Only write a value back if it is still the value we
+        // wrote: someone else's clock is someone else's business.
+        public static float TimeScaleWeWrote;
+        public static float FixedStepWeWrote;
+
         private Harmony harmony;
 
         // Running order within a section. ConfigurationManager lists higher numbers first.
@@ -123,6 +140,13 @@ namespace ThreeSheets
             FreeCursorInConfigMenu = Toggle(SecGeneral, "FreeCursorInConfigMenu", true,
                 "Stops the view turning while the F1 config menu is open. Turn this off if the cursor " +
                 "ever gets stuck.");
+            UnstickPlayer = Toggle(SecGeneral, "UnstickPlayer", true,
+                "Switch your movement back on if this mod ever leaves it off. Turn it off if it fights " +
+                "another mod that freezes you on purpose.",
+                advanced: true);
+            UnstickAfterSeconds = Slider(SecGeneral, "UnstickAfterSeconds", 3f, 0.5f, 15f,
+                "How long your movement has to be off for no reason before it is switched back on.",
+                advanced: true);
 
             // ---- 2. Drinking ----
             order = 1000;
@@ -154,6 +178,13 @@ namespace ThreeSheets
                 "another player is connected.");
             WakeAtBac = Slider(SecBlackout, "WakeAtBloodAlcohol", 40f, 0f, 150f,
                 "You wake once your blood alcohol has fallen to this. A sip of rum is 18.");
+            WakeWhenFlooding = Toggle(SecBlackout, "WakeWhenFlooding", true,
+                "Wake up when the ship you are on starts taking water, and do not let you pass out on a " +
+                "ship that is already taking it. Off means you sleep through a sinking. You always wake " +
+                "when she goes under, whatever this is set to.");
+            FloodWakeLevel = Slider(SecBlackout, "FloodWakeLevel", 0.10f, 0.02f, 0.90f,
+                "How flooded the ship has to be to wake you, as a share of her hull filling up. The game " +
+                "wakes a sleeper at the same 0.1.");
             MinOutHours = Slider(SecBlackout, "MinOutHours", 2f, 0.5f, 6f,
                 "Fewest game hours a blackout lasts.");
             MaxOutHours = Slider(SecBlackout, "MaxOutHours", 8f, 1f, 12f,
@@ -173,6 +204,10 @@ namespace ThreeSheets
             HangoverFloor = Slider(SecBlackout, "HangoverFloor", 15f, 0f, 50f,
                 "The hangover will not push a need below this. Stops a blackout chaining into a " +
                 "vanilla thirst pass-out, which moves you to port.",
+                advanced: true);
+            RoughWakeSeconds = Slider(SecBlackout, "RoughWakeSeconds", 0.9f, 0.3f, 3f,
+                "How fast you come round when something wakes you early instead of you sleeping it off. " +
+                "Waking normally stays slower.",
                 advanced: true);
 
             // ---- 4. Drunk Effects ----
@@ -270,7 +305,8 @@ namespace ThreeSheets
             BlackoutKey = Config.Bind(SecTesting, "BlackoutKey", KeyboardShortcut.Empty,
                 new ConfigDescription(
                     "Testing only, leave unbound for normal play. Press to black out immediately, " +
-                    "running the full sequence. Ignores the grace period and the Blackout/Enabled switch.",
+                    "running the full sequence. Ignores the grace period and the Blackout/Enabled switch. " +
+                    "Still refused while the ship you are on is taking water.",
                     null, Attributes(false)));
 
             harmony = new Harmony(PluginGuid);

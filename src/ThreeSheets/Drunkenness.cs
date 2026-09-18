@@ -67,6 +67,15 @@ namespace ThreeSheets
             get
             {
                 if (!Plugin.BlackoutEnabled.Value && HoldLevel <= 0f) return 0f;
+
+                // A blackout that is currently refused has no collapse to warn about. The refusal lasts
+                // as long as the hull is taking water (BlackoutGuard.RefuseToStart), and pinning the
+                // vignette fully closed for that whole fight is the opposite of what this release is
+                // for: the player is bailing and pumping, and they need to see the ship. The warning
+                // comes straight back the moment the bilge is clear, which is also when they can drop.
+                // The testing hold is exempt, so the vignette can still be tuned anywhere.
+                if (HoldLevel <= 0f && BoatWatch.FloodingOrSunk()) return 0f;
+
                 float threshold = Plugin.BlackoutThreshold.Value;
                 float warn = threshold * Mathf.Clamp01(Plugin.WarnFraction.Value);
                 if (threshold <= warn) return 0f;
@@ -152,6 +161,33 @@ namespace ThreeSheets
             Stomach = 0f;
             Bac = Mathf.Clamp(Mathf.Min(Bac, Mathf.Max(0f, residual)), 0f, 1000f);
             GraceRemaining = Plugin.BlackoutGraceSeconds.Value;
+        }
+
+        /// <summary>
+        /// Shaken awake rather than slept off: whatever is in the blood stays exactly where it is,
+        /// because a blackout cut short after twenty seconds burned almost none of it and sobering the
+        /// player up would be a reward for sinking. The stomach is still emptied - anything left in
+        /// there would carry on absorbing and put them straight back down - and the grace period is
+        /// armed so they get time to fight for the ship before the next collapse.
+        /// </summary>
+        public static void WakeRough()
+        {
+            Stomach = 0f;
+            GraceRemaining = Plugin.BlackoutGraceSeconds.Value;
+        }
+
+        /// <summary>
+        /// The brake for a blackout that keeps failing. Keeps the drink - vanilla's awake rest drain
+        /// reads PlayerNeeds.alcohol and is not this mod's to switch off - but parks the level just
+        /// under the threshold, so a sequence that is broken for a structural reason stops firing
+        /// instead of dropping the player again every time the grace period runs out.
+        /// </summary>
+        public static void HoldUnderThreshold()
+        {
+            Stomach = 0f;
+            float threshold = Plugin.BlackoutThreshold.Value;
+            if (Bac >= threshold) Bac = Mathf.Max(0f, threshold - 1f);
+            GraceRemaining = Mathf.Max(GraceRemaining, Plugin.BlackoutGraceSeconds.Value);
         }
 
         /// <summary>Wipe the slate. Used by the watchdog, where the safe thing is to leave nothing behind.</summary>
